@@ -627,9 +627,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        pretrain_gpt, "get_batch_on_this_tp_rank", lambda *args, **kwargs: source_batch.copy()
-    )
+
+    def get_batch_on_this_tp_rank(*args, **kwargs):
+        assert kwargs["needs_padding_mask"] is True
+        return source_batch.copy()
+
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
 
     *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))

@@ -530,9 +530,13 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(
+    data_iterator, mtp_on_this_rank: bool = False, needs_padding_mask: bool = False
+):
 
     args = get_args()
+    # Optional input structure must be identical across TP ranks and remain
+    # static during full-iteration CUDA Graph capture.
 
     def _broadcast(item):
         if item is not None:
@@ -556,7 +560,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
             'padding_mask': (
-                None if "padding_mask" not in data else data["padding_mask"].cuda(non_blocking=True)
+                data["padding_mask"].cuda(non_blocking=True) if needs_padding_mask else None
             ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
             'cu_seqlens': (
@@ -571,13 +575,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
         }
-
-        has_padding_mask = torch.tensor(
-            [batch['padding_mask'] is not None],
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-        _broadcast(has_padding_mask)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
@@ -647,9 +644,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             batch['local_cp_size'] = None
 
     else:
-        has_padding_mask = torch.empty(1, dtype=torch.int64, device=torch.cuda.current_device())
-        _broadcast(has_padding_mask)
-
         if args.dynamic_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
@@ -662,7 +656,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         loss_mask = torch.empty(shape, dtype=torch.float32, device=torch.cuda.current_device())
         padding_mask = (
             torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
-            if bool(has_padding_mask.item())
+            if needs_padding_mask
             else None
         )
         if args.create_attention_mask_in_dataloader:

@@ -155,6 +155,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        needs_padding_mask=needs_padding_mask,
     )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
