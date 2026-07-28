@@ -136,9 +136,7 @@ def test_resolve_thd_tail_padding_policy():
     )
     # Explicit policies are returned as-is.
     assert (
-        resolve_thd_tail_padding_policy(
-            SimpleNamespace(thd_tail_padding_policy="extend_last")
-        )
+        resolve_thd_tail_padding_policy(SimpleNamespace(thd_tail_padding_policy="extend_last"))
         == "extend_last"
     )
     with pytest.raises(AssertionError, match="Unsupported thd_tail_padding_policy"):
