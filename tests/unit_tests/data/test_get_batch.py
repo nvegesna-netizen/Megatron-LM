@@ -206,7 +206,8 @@ def test_get_batch_on_this_tp_rank_full_iteration_cudagraph_safe(
     graph.replay()
     torch.cuda.synchronize()
 
-    assert marker.item() == 2
+    # Capture records CUDA work without executing it; one replay increments once.
+    assert marker.item() == 1
     assert (batch["padding_mask"] is not None) == needs_padding_mask
 
 
