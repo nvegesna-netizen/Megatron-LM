@@ -2912,6 +2912,10 @@ class MLATransformerConfig(TransformerConfig):
     kv_lora_rank: int = 512
     """Rank of Key and Value tensors' low rank representation."""
 
+    mla_layernorm_epsilon: float | None = None
+    """Epsilon for the query and key-value latent norms in MLA.
+       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
+
     qk_head_dim: int = 128
     """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
 
@@ -2963,6 +2967,9 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.mla_layernorm_epsilon is None:
+            self.mla_layernorm_epsilon = self.layernorm_epsilon
+
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
