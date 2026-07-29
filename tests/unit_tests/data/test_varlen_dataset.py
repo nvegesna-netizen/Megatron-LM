@@ -583,7 +583,7 @@ def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
 
 def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     """CP zigzag slicing must select identical token and padding-mask positions."""
-    from megatron.core.utils import get_pretrain_batch_on_this_cp_rank
+    from megatron.core.utils import get_batch_on_this_cp_rank
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 1)
@@ -591,7 +591,7 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     tokens = torch.arange(16, dtype=torch.int64).view(1, 16)
     padding_mask = tokens >= 10
     batch = {"tokens": tokens.clone(), "padding_mask": padding_mask.clone()}
-    result = get_pretrain_batch_on_this_cp_rank(batch, cp_group=object())
+    result = get_batch_on_this_cp_rank(batch, cp_group=object())
 
     expected_indices = torch.tensor([2, 3, 12, 13])
     assert torch.equal(result["tokens"], tokens.index_select(1, expected_indices))
