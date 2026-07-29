@@ -17,21 +17,11 @@ def test_core_gpt_dataset_config_forwards_sft_mock_dataset_config(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        [
-            "pretrain_gpt.py",
-            "--seq-length",
-            "2048",
-            "--sft-mock-dataset-config-json",
-            config_json,
-        ],
+        ["pretrain_gpt.py", "--seq-length", "2048", "--sft-mock-dataset-config-json", config_json],
     )
     args = parse_args()
-    monkeypatch.setattr(
-        pretrain_gpt, "build_tokenizer", lambda _: SimpleNamespace(vocab_size=2048)
-    )
-    monkeypatch.setattr(
-        pretrain_gpt, "get_blend_and_blend_per_split", lambda _: (None, None)
-    )
+    monkeypatch.setattr(pretrain_gpt, "build_tokenizer", lambda _: SimpleNamespace(vocab_size=2048))
+    monkeypatch.setattr(pretrain_gpt, "get_blend_and_blend_per_split", lambda _: (None, None))
 
     config = pretrain_gpt.core_gpt_dataset_config_from_args(args)
 
