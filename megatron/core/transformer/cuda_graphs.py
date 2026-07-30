@@ -1565,23 +1565,6 @@ class _CudaGraphRunner(torch.nn.Module):
         for t in self.get_tensors(outputs):
             _apply_cudagraph_buffer_metadata(t, is_output=True)
 
-    def _make_pipeline_output_viewless(self, output):
-        """Make a last-stage record or replay output safe for pipeline deallocation."""
-
-        if not (self.is_last_layer and self.deallocate_pipeline_outputs):
-            return output
-
-        return tree_map(
-            lambda value: (
-                make_viewless_tensor(
-                    inp=value, requires_grad=value.requires_grad, keep_graph=True
-                )
-                if torch.is_tensor(value)
-                else value
-            ),
-            output,
-        )
-
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
         The first pass records a graph and appends the runner to _CudagraphGlobalRecord.
@@ -1608,7 +1591,17 @@ class _CudaGraphRunner(torch.nn.Module):
         # _CudagraphRecordNode is a custom autograd Function, so tensors returned directly from
         # it are views. Pipeline schedules may pseudo-deallocate this first-pass output before
         # create_cudagraphs() switches the runner to replay mode.
-        out = self._make_pipeline_output_viewless(out)
+        if self.is_last_layer and self.deallocate_pipeline_outputs:
+            out = tree_map(
+                lambda value: (
+                    make_viewless_tensor(
+                        inp=value, requires_grad=value.requires_grad, keep_graph=True
+                    )
+                    if torch.is_tensor(value)
+                    else value
+                ),
+                out,
+            )
 
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
@@ -1663,7 +1656,17 @@ class _CudaGraphRunner(torch.nn.Module):
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
 
         # The replay node has the same custom-autograd output-view behavior as the record node.
-        out = self._make_pipeline_output_viewless(out)
+        if self.is_last_layer and self.deallocate_pipeline_outputs:
+            out = tree_map(
+                lambda value: (
+                    make_viewless_tensor(
+                        inp=value, requires_grad=value.requires_grad, keep_graph=True
+                    )
+                    if torch.is_tensor(value)
+                    else value
+                ),
+                out,
+            )
 
         out_iter = iter(self.to_list(out))
         fwd_outputs = self.to_list(self.fwd_graph_outputs)
