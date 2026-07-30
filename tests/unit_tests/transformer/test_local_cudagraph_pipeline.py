@@ -65,9 +65,13 @@ class TestLocalCudagraphPipeline:
         assert all(hasattr(layer, "cudagraph_manager") for layer in block.layers)
         assert all(not layer.is_moe_layer for layer in block.layers)
 
-    def test_last_replay_output_supports_pipeline_deallocation(self):
+    @pytest.mark.parametrize(
+        "cuda_graph_module",
+        [CudaGraphModule.attn, CudaGraphModule.mlp],
+    )
+    def test_record_and_replay_outputs_support_pipeline_deallocation(self, cuda_graph_module):
         config = self._make_config(
-            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_modules=[cuda_graph_module],
             deallocate_pipeline_outputs=True,
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
@@ -85,12 +89,18 @@ class TestLocalCudagraphPipeline:
             (1, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
         )
 
-        eager_out = block(hidden_states=hidden_states, attention_mask=attention_mask)
-        eager_out.sum().backward()
+        record_out = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        expected_shape = record_out.shape
+        assert torch.isfinite(record_out).all()
+        assert record_out._base is None
+
+        record_grad = torch.ones_like(record_out)
+        deallocate_output_tensor(record_out, deallocate_pipeline_outputs=True)
+        custom_backward(record_out, record_grad)
         create_cudagraphs()
 
         graphed_out = block(hidden_states=hidden_states, attention_mask=attention_mask)
-        assert graphed_out.shape == eager_out.shape
+        assert graphed_out.shape == expected_shape
         assert torch.isfinite(graphed_out).all()
         assert graphed_out._base is None
 
