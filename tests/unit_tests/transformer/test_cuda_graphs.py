@@ -24,7 +24,11 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+from megatron.core.pipeline_parallel.schedules import (
+    custom_backward,
+    deallocate_output_tensor,
+    set_current_microbatch,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -450,6 +454,26 @@ class TestParallelTransformerBlockCudagraphs:
                 .fwd_graph
             )
 
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_dense_mlp_scope_constructs(self):
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.mlp],
+        )
+
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
+        assert len(block.layers) > 0
+        assert all(hasattr(layer, "cudagraph_manager") for layer in block.layers)
+        assert all(not layer.is_moe_layer for layer in block.layers)
+
 
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -534,6 +558,7 @@ class TestPackedSeqCudagraphs:
             deterministic_mode=True,
             cuda_graph_impl="local",
             cuda_graph_warmup_steps=1,
+            deallocate_pipeline_outputs=True,
             use_cpu_initialization=True,
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
@@ -624,7 +649,10 @@ class TestPackedSeqCudagraphs:
             "CUDA graph replay output is not bitwise equal to eager output: "
             f"max_abs_diff={(graphed_out.float() - eager_out.float()).abs().max().item()}"
         )
-        graphed_out.sum().backward()
+        assert graphed_out._base is None
+        graphed_grad = torch.ones_like(graphed_out)
+        deallocate_output_tensor(graphed_out, deallocate_pipeline_outputs=True)
+        custom_backward(graphed_out, graphed_grad)
 
         # Destroy captured graphs deterministically before parallel-state teardown.
         for layer in block.layers:

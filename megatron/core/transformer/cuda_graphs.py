@@ -37,6 +37,7 @@ from megatron.core.utils import (
     is_te_min_version,
     log_on_each_pipeline_stage,
     log_single_rank,
+    make_viewless_tensor,
 )
 
 try:
@@ -1639,6 +1640,23 @@ class _CudaGraphRunner(torch.nn.Module):
             func_args = inp_tensors
 
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
+
+        # A custom autograd Function exposes tensors returned directly from forward as views.
+        # The last local graph in a pipeline stage can therefore turn an otherwise-viewless
+        # TransformerLayer output into a view, which is incompatible with pipeline output
+        # pseudo-deallocation. Remove that alias without copying the activation, while keeping
+        # the replay node in the autograd graph.
+        if self.is_last_layer and self.deallocate_pipeline_outputs:
+            out = tree_map(
+                lambda value: (
+                    make_viewless_tensor(
+                        inp=value, requires_grad=value.requires_grad, keep_graph=True
+                    )
+                    if torch.is_tensor(value)
+                    else value
+                ),
+                out,
+            )
 
         out_iter = iter(self.to_list(out))
         fwd_outputs = self.to_list(self.fwd_graph_outputs)
