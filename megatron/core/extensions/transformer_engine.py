@@ -11,7 +11,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -2891,53 +2891,42 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 kwargs["cache_quantized_input"] = cache_quantized_input
             return op_type(**kwargs)
 
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """Attempt to emulate submodule callback hooks.
+        def _register_forward_pre_hooks_on_fused_impl(
+            self, fused_impl: torch.nn.Module, source_submodules: Sequence[torch.nn.Module]
+        ) -> None:
+            """Forward current source-submodule pre-hooks at an execution boundary."""
 
-            This is not always possible because Transformer Engine's
-            op fuser does not expose intermediate tensors. Depending
-            on what kernel fusions the op fuser chooses, the
-            intermediate tensors may not even exist. Hooks that modify
-            tensors will result in incorrect behavior.
+            source_submodules = tuple(source_submodules)
+            if not source_submodules:
+                return
 
-            """
+            distributed_data_parallel = None
+            warned_non_ddp_hooks = set()
 
-            # Get submodule hooks
-            forward_pre_hooks = []
-            forward_post_hooks = []
-            backward_pre_hooks = []
-            backward_post_hooks = []
-            for submodule in self.modules():
-                for hook_id, hook in submodule._forward_pre_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
-                    forward_pre_hooks.append((submodule, hook, with_kwargs))
-                for hook_id, hook in submodule._forward_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
-                    forward_post_hooks.append((submodule, hook, with_kwargs))
-                for hook in submodule._backward_pre_hooks.values():
-                    backward_pre_hooks.append((submodule, hook))
-                for hook in submodule._backward_hooks.values():
-                    backward_post_hooks.append((submodule, hook))
+            def forward_pre_hook(module, *_) -> None:
+                nonlocal distributed_data_parallel
+                for submodule in source_submodules:
+                    hooks_with_kwargs = submodule._forward_pre_hooks_with_kwargs
+                    for hook_id, hook in list(submodule._forward_pre_hooks.items()):
+                        if distributed_data_parallel is None:
+                            from megatron.core.distributed import (
+                                distributed_data_parallel as ddp_module,
+                            )
 
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
-            if forward_pre_hooks:
-                from megatron.core.distributed import distributed_data_parallel
-
-                if any(
-                    inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook, _ in forward_pre_hooks
-                ):
-                    warnings.warn(
-                        "TEFusedMLP module has a submodule with a pre-forward hook. "
-                        "TEFusedMLP module does not expose intermediate tensors, "
-                        "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
-                    )
-
-                def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                            distributed_data_parallel = ddp_module
+                        hook_key = (id(submodule), hook_id)
+                        if (
+                            inspect.getmodule(hook) != distributed_data_parallel
+                            and hook_key not in warned_non_ddp_hooks
+                        ):
+                            warnings.warn(
+                                "TEFusedMLP module has a submodule with a pre-forward hook. "
+                                "TEFusedMLP module does not expose intermediate tensors, "
+                                "so the hook may have incorrect behavior if it attempts to "
+                                "access the input tensor."
+                            )
+                            warned_non_ddp_hooks.add(hook_key)
+                        with_kwargs = hook_id in hooks_with_kwargs
                         if with_kwargs:
                             ret = hook(submodule, (), {})
                         else:
@@ -2948,9 +2937,50 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                                 "submodule has pre-forward hook that modifies input tensor."
                             )
 
-                fused_impl.register_forward_pre_hook(forward_pre_hook)
+            fused_impl.register_forward_pre_hook(forward_pre_hook)
 
-            # Post-forward hooks
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+
+            """
+
+            # Hooks on TEFusedMLP itself are executed by its normal Module.__call__.
+            # Cache only the descendants whose calls the fused implementation skips.
+            skipped_submodules = tuple(
+                submodule for submodule in self.modules() if submodule is not self
+            )
+            for submodule in skipped_submodules:
+                if submodule._backward_pre_hooks:
+                    raise RuntimeError(
+                        "TEFusedMLP module does not support submodules with " "pre-backward hooks"
+                    )
+                if submodule._backward_hooks:
+                    raise RuntimeError(
+                        "TEFusedMLP module does not support submodules with " "post-backward hooks"
+                    )
+
+            if pre_forward_submodules is None:
+                pre_forward_submodules = skipped_submodules
+            self._register_forward_pre_hooks_on_fused_impl(fused_impl, pre_forward_submodules)
+
+            # Preserve the existing post-hook behavior without adding an unconditional
+            # forward-hook dispatch to models that do not use post hooks.
+            forward_post_hooks = []
+            for submodule in skipped_submodules:
+                hooks_with_kwargs = submodule._forward_hooks_with_kwargs
+                for hook_id, hook in submodule._forward_hooks.items():
+                    forward_post_hooks.append((submodule, hook, hook_id in hooks_with_kwargs))
             if forward_post_hooks:
                 warnings.warn(
                     "TEFusedMLP module has a submodule with a post-forward hook. "
@@ -2972,16 +3002,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                             )
 
                 fused_impl.register_forward_hook(forward_post_hook)
-
-            # Backward hooks
-            if backward_pre_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with pre-backward hooks"
-                )
-            if backward_post_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with post-backward hooks"
-                )
 
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
@@ -3162,6 +3182,36 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             self._register_hooks_on_fused_impl(fused_impl)
             return fused_impl
+
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Register hook forwarding for the grouped and normalization boundaries."""
+
+            if get_tensor_model_parallel_world_size() > 1:
+                super()._register_hooks_on_fused_impl(
+                    fused_impl, pre_forward_submodules=pre_forward_submodules
+                )
+                return
+            if pre_forward_submodules is not None:
+                raise ValueError("Grouped MLP pre-forward hook phases are selected internally")
+            if self._norm_seq is None:
+                raise RuntimeError("Grouped MLP normalization sequence has not been built")
+
+            fc1_submodules = tuple(self.linear_fc1.modules())
+            fc1_submodule_ids = {id(submodule) for submodule in fc1_submodules}
+            remaining_submodules = tuple(
+                submodule
+                for submodule in self.modules()
+                if submodule is not self and id(submodule) not in fc1_submodule_ids
+            )
+            super()._register_hooks_on_fused_impl(
+                fused_impl, pre_forward_submodules=remaining_submodules
+            )
+            self._register_forward_pre_hooks_on_fused_impl(self._norm_seq[0], fc1_submodules)
 
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
