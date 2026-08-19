@@ -11,7 +11,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -2892,7 +2892,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             return op_type(**kwargs)
 
         def _register_forward_pre_hooks_on_fused_impl(
-            self, fused_impl: torch.nn.Module, source_submodules: Sequence[torch.nn.Module]
+            self, fused_impl: torch.nn.Module, source_submodules: Tuple[torch.nn.Module, ...]
         ) -> None:
             """Forward current source-submodule pre-hooks at an execution boundary."""
 
@@ -2943,7 +2943,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             self,
             fused_impl: torch.nn.Module,
             *,
-            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+            pre_forward_submodules: Optional[Tuple[torch.nn.Module, ...]] = None,
         ) -> None:
             """Attempt to emulate submodule callback hooks.
 
@@ -3187,7 +3187,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             self,
             fused_impl: torch.nn.Module,
             *,
-            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+            pre_forward_submodules: Optional[Tuple[torch.nn.Module, ...]] = None,
         ) -> None:
             """Register hook forwarding for the grouped and normalization boundaries."""
 
