@@ -120,6 +120,8 @@ def test_self_attention_qk_layernorm_fused_matches_unfused():
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
         )
         spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True)
         attn = build_module(spec.submodules.self_attention, config=cfg, layer_number=1).cuda()
