@@ -55,7 +55,10 @@ def _sin(x):
 def _rsqrt(x):
     return libdevice.rsqrt(x)
 
-_BWD_TOKENS_PER_PROGRAM = 16
+# Launch shape: tokens handled per program (looped) and warps per program. Module-level so a
+# benchmark can sweep them; no autotuning, so the first call is safe ahead of CUDA graph capture.
+FWD_TOKENS, FWD_WARPS = 1, 4
+BWD_TOKENS, BWD_WARPS = 16, 4
 
 
 @triton.jit
@@ -68,6 +71,7 @@ def _qkv_qknorm_rope_fwd_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    T,
     B,
     stride_qkv_s,
     stride_qkv_b,
@@ -81,58 +85,63 @@ def _qkv_qknorm_rope_fwd_kernel(
     NQ_P2: tl.constexpr,
     HN: tl.constexpr,
     SAME_FREQS: tl.constexpr,
+    TOKENS: tl.constexpr,
 ):
     HALF: tl.constexpr = HN // 2
-    tok = tl.program_id(0).to(tl.int64)
+    pid_t = tl.program_id(0).to(tl.int64)
     g = tl.program_id(1)
-    s = tok // B
-    bi = tok % B
-    base = qkv_ptr + s * stride_qkv_s + bi * stride_qkv_b + g * stride_qkv_g
     d = tl.arange(0, HALF)
     h = tl.arange(0, NQ_P2)
     hmask = h[:, None] < NQ
     out_dtype = q_ptr.dtype.element_ty
-
-    # Query heads: [NQ_P2, HALF] halves.
-    qoff = h[:, None] * HN + d[None, :]
-    x1 = tl.load(base + qoff, mask=hmask, other=0.0).to(tl.float32)
-    x2 = tl.load(base + qoff + HALF, mask=hmask, other=0.0).to(tl.float32)
     w1 = tl.load(qw_ptr + d).to(tl.float32) + W_OFFSET
     w2 = tl.load(qw_ptr + HALF + d).to(tl.float32) + W_OFFSET
-    f1 = tl.load(qf_ptr + s * stride_qf_s + d)
-    f2 = tl.load(qf_ptr + s * stride_qf_s + HALF + d)
-    c1, s1, c2, s2 = _cos(f1), _sin(f1), _cos(f2), _sin(f2)
-    rs = _rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / HN + eps)
-    n1 = (x1 * rs[:, None] * w1[None, :]).to(out_dtype).to(tl.float32)
-    n2 = (x2 * rs[:, None] * w2[None, :]).to(out_dtype).to(tl.float32)
-    o1 = n1 * c1[None, :] - n2 * s1[None, :]
-    o2 = n2 * c2[None, :] + n1 * s2[None, :]
-    qout = q_ptr + (tok * NG * NQ + g * NQ) * HN + qoff
-    tl.store(qout, o1.to(out_dtype), mask=hmask)
-    tl.store(qout + HALF, o2.to(out_dtype), mask=hmask)
-
-    # Key head.
-    kin = base + NQ * HN
-    y1 = tl.load(kin + d).to(tl.float32)
-    y2 = tl.load(kin + HALF + d).to(tl.float32)
     u1 = tl.load(kw_ptr + d).to(tl.float32) + W_OFFSET
     u2 = tl.load(kw_ptr + HALF + d).to(tl.float32) + W_OFFSET
-    if not SAME_FREQS:
-        f1 = tl.load(kf_ptr + s * stride_kf_s + d)
-        f2 = tl.load(kf_ptr + s * stride_kf_s + HALF + d)
-        c1, s1, c2, s2 = _cos(f1), _sin(f1), _cos(f2), _sin(f2)
-    rk = _rsqrt((tl.sum(y1 * y1, axis=0) + tl.sum(y2 * y2, axis=0)) / HN + eps)
-    m1 = (y1 * rk * u1).to(out_dtype).to(tl.float32)
-    m2 = (y2 * rk * u2).to(out_dtype).to(tl.float32)
-    kout = k_ptr + (tok * NG + g) * HN
-    tl.store(kout + d, (m1 * c1 - m2 * s1).to(out_dtype))
-    tl.store(kout + HALF + d, (m2 * c2 + m1 * s2).to(out_dtype))
 
-    # Value head: plain copy.
-    vin = base + (NQ + 1) * HN
-    vout = v_ptr + (tok * NG + g) * HN
-    tl.store(vout + d, tl.load(vin + d))
-    tl.store(vout + HALF + d, tl.load(vin + HALF + d))
+    for i in range(TOKENS):
+        tok = pid_t * TOKENS + i
+        if tok < T:
+            s = tok // B
+            bi = tok % B
+            base = qkv_ptr + s * stride_qkv_s + bi * stride_qkv_b + g * stride_qkv_g
+
+            # Query heads: [NQ_P2, HALF] halves.
+            qoff = h[:, None] * HN + d[None, :]
+            x1 = tl.load(base + qoff, mask=hmask, other=0.0).to(tl.float32)
+            x2 = tl.load(base + qoff + HALF, mask=hmask, other=0.0).to(tl.float32)
+            f1 = tl.load(qf_ptr + s * stride_qf_s + d)
+            f2 = tl.load(qf_ptr + s * stride_qf_s + HALF + d)
+            c1, s1, c2, s2 = _cos(f1), _sin(f1), _cos(f2), _sin(f2)
+            rs = _rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / HN + eps)
+            n1 = (x1 * rs[:, None] * w1[None, :]).to(out_dtype).to(tl.float32)
+            n2 = (x2 * rs[:, None] * w2[None, :]).to(out_dtype).to(tl.float32)
+            o1 = n1 * c1[None, :] - n2 * s1[None, :]
+            o2 = n2 * c2[None, :] + n1 * s2[None, :]
+            qout = q_ptr + (tok * NG * NQ + g * NQ) * HN + qoff
+            tl.store(qout, o1.to(out_dtype), mask=hmask)
+            tl.store(qout + HALF, o2.to(out_dtype), mask=hmask)
+
+            # Key head.
+            kin = base + NQ * HN
+            y1 = tl.load(kin + d).to(tl.float32)
+            y2 = tl.load(kin + HALF + d).to(tl.float32)
+            if not SAME_FREQS:
+                f1 = tl.load(kf_ptr + s * stride_kf_s + d)
+                f2 = tl.load(kf_ptr + s * stride_kf_s + HALF + d)
+                c1, s1, c2, s2 = _cos(f1), _sin(f1), _cos(f2), _sin(f2)
+            rk = _rsqrt((tl.sum(y1 * y1, axis=0) + tl.sum(y2 * y2, axis=0)) / HN + eps)
+            m1 = (y1 * rk * u1).to(out_dtype).to(tl.float32)
+            m2 = (y2 * rk * u2).to(out_dtype).to(tl.float32)
+            kout = k_ptr + (tok * NG + g) * HN
+            tl.store(kout + d, (m1 * c1 - m2 * s1).to(out_dtype))
+            tl.store(kout + HALF + d, (m2 * c2 + m1 * s2).to(out_dtype))
+
+            # Value head: plain copy.
+            vin = base + (NQ + 1) * HN
+            vout = v_ptr + (tok * NG + g) * HN
+            tl.store(vout + d, tl.load(vin + d))
+            tl.store(vout + HALF + d, tl.load(vin + HALF + d))
 
 
 @triton.jit
@@ -278,7 +287,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
         q = mixed_qkv.new_empty(sq, b, ng * nq, hn)
         k = mixed_qkv.new_empty(sq, b, ng, hn)
         v = mixed_qkv.new_empty(sq, b, ng, hn)
-        _qkv_qknorm_rope_fwd_kernel[(sq * b, ng)](
+        _qkv_qknorm_rope_fwd_kernel[(triton.cdiv(sq * b, FWD_TOKENS), ng)](
             mixed_qkv,
             qf,
             kf,
@@ -287,6 +296,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             q,
             k,
             v,
+            sq * b,
             b,
             mixed_qkv.stride(0),
             mixed_qkv.stride(1),
@@ -300,7 +310,8 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             NQ_P2=triton.next_power_of_2(nq),
             HN=hn,
             SAME_FREQS=kf is qf,
-            num_warps=4,
+            TOKENS=FWD_TOKENS,
+            num_warps=FWD_WARPS,
         )
         ctx.save_for_backward(mixed_qkv, qf, kf, q_weight, k_weight)
         ctx.cfg = (nq, eps, zero_centered_gamma)
@@ -313,7 +324,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
         sq, b, ng, row = mixed_qkv.shape
         hn = row // (nq + 2)
         T = sq * b
-        n_t = triton.cdiv(T, _BWD_TOKENS_PER_PROGRAM)
+        n_t = triton.cdiv(T, BWD_TOKENS)
         dqkv = mixed_qkv.new_empty(sq, b, ng, row)
         dqw_part = torch.empty(n_t * ng, hn, device=mixed_qkv.device, dtype=torch.float32)
         dkw_part = torch.empty_like(dqw_part)
@@ -342,9 +353,9 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             NQ=nq,
             NQ_P2=triton.next_power_of_2(nq),
             HN=hn,
-            TOKENS=_BWD_TOKENS_PER_PROGRAM,
+            TOKENS=BWD_TOKENS,
             SAME_FREQS=kf is qf,
-            num_warps=4,
+            num_warps=BWD_WARPS,
         )
         dqw = dqw_part.sum(0).to(q_weight.dtype)
         dkw = dkw_part.sum(0).to(k_weight.dtype)
