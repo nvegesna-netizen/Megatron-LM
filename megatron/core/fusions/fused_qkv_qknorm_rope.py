@@ -57,8 +57,9 @@ def _rsqrt(x):
 
 # Launch shape: tokens handled per program (looped) and warps per program. Module-level so a
 # benchmark can sweep them; no autotuning, so the first call is safe ahead of CUDA graph capture.
-FWD_TOKENS, FWD_WARPS = 1, 4
-BWD_TOKENS, BWD_WARPS = 16, 4
+# Swept on VRNVL72 at nq 8 and 16 (head dim 128). BWD_WARPS None: 1 warp up to 8 query heads per group, else 2.
+FWD_TOKENS, FWD_WARPS = 1, 1
+BWD_TOKENS, BWD_WARPS = 16, None
 
 
 @triton.jit
@@ -355,7 +356,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             HN=hn,
             TOKENS=BWD_TOKENS,
             SAME_FREQS=kf is qf,
-            num_warps=BWD_WARPS,
+            num_warps=BWD_WARPS or (1 if nq <= 8 else 2),
         )
         dqw = dqw_part.sum(0).to(q_weight.dtype)
         dkw = dkw_part.sum(0).to(k_weight.dtype)
